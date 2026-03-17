@@ -41,12 +41,6 @@ def record_points(evt: gr.SelectData):
 
 # Point-guided image deformation
 def point_guided_deformation(image, source_pts, target_pts, alpha=1.0, eps=1e-8):
-    """
-    Return
-    ------
-        A deformed image.
-    """
-
     warped_image = np.array(image)
     ### FILL: Implement MLS or RBF based image warping
 
