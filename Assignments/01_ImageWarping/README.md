@@ -1,62 +1,38 @@
 # Assignment 1 - Image Warping
 
-### In this assignment, you will implement basic transformation and point-based deformation for images.
-
-### Resources:
-- [Teaching Slides](https://pan.ustc.edu.cn/share/index/66294554e01948acaf78) 
-- [Paper: Image Deformation Using Moving Least Squares](https://people.engr.tamu.edu/schaefer/research/mls.pdf)
-- [Paper: Image Warping by Radial Basis Functions](https://www.sci.utah.edu/~gerig/CS6640-F2010/Project3/Arad-1995.pdf)
-- [OpenCV Geometric Transformations](https://docs.opencv.org/4.x/da/d6e/tutorial_py_geometric_transformations.html)
-- [Gradio: 一个好用的网页端交互GUI](https://www.gradio.app/)
-
-### 1. Basic Image Geometric Transformation (Scale/Rotation/Translation).
-Fill the [Missing Part](run_global_transform.py#L21) of 'run_global_transform.py'.
-
-
-### 2. Point Based Image Deformation.
-
-Implement MLS or RBF based image deformation in the [Missing Part](run_point_transform.py#L52) of 'run_point_transform.py'.
-
----
-## 一个作业提交模板 (里面的结果也可参考)
-
-
-## Implementation of Image Geometric Transformation
-
-This repository is Yudong Guo's implementation of Assignment_01 of DIP. 
-
-<img src="pics/teaser.png" alt="alt text" width="800">
+本仓库为高凡(SA25001019) DIP HW1 Image Warping 作业代码仓
 
 ## Requirements
+Python Version: 3.14
 
-To install requirements:
-
-```setup
-python -m pip install -r requirements.txt
+You can initialize the environment with [uv](https://docs.astral.sh/uv/):
+```shell
+# after cd to this directory
+uv sync
+uv pip install -r requirements.txt
 ```
 
-
-## Running
-
-To run basic transformation, run:
-
-```basic
-python run_global_transform.py
+or just install the requirements (if you already have pip):
+```shell
+pip install -r requirements.txt
 ```
 
-To run point guided transformation, run:
-
-```point
-python run_point_transform.py
+## Evaluation
+To run global transform:
+```shell
+python ./run_global_transform.py
 ```
 
-## Results (need add more result images)
-### Basic Transformation
-<img src="pics/global_demo.gif" alt="alt text" width="800">
+To run point-guided transform:
+```shell
+python ./run_point_transform.py
+```
+> There are some images in the data/ folder. You can use them for test.
+## Results
+### Global Transform
+依次操作为：缩放、旋转、平移、翻转
+![](./assets/global-tran.gif)
 
-### Point Guided Deformation:
-<img src="pics/point_demo.gif" alt="alt text" width="800">
-
-## Acknowledgement
-
->📋 Thanks for the algorithms proposed by [Image Deformation Using Moving Least Squares](https://people.engr.tamu.edu/schaefer/research/mls.pdf).
+### Point-Guided Transform
+在不同选点下Warping的结果
+![](./assets/pb-tran.gif)
