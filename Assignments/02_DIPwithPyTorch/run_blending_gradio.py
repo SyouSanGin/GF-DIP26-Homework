@@ -1,5 +1,5 @@
 import gradio as gr
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 import numpy as np
 import torch
 
@@ -108,7 +108,16 @@ def create_mask_from_points(points, img_h, img_w):
     mask = np.zeros((img_h, img_w), dtype=np.uint8)
     ### FILL: Obtain Mask from Polygon Points. 
     ### 0 indicates outside the Polygon.
-    ### 255 indicates inside the Polygon.
+    ### 225 indicates inside the Polygon.
+
+    if points is None or len(points) < 3:
+        return mask
+
+    polygon = [tuple(map(int, p)) for p in points]
+    mask_img = Image.new('L', (img_w, img_h), 0)
+    draw = ImageDraw.Draw(mask_img)
+    draw.polygon(polygon, fill=225)
+    mask = np.array(mask_img, dtype=np.uint8)
 
     return mask
 
@@ -126,9 +135,20 @@ def cal_laplacian_loss(foreground_img, foreground_mask, blended_img, background_
     Returns:
         torch.Tensor: The computed Laplacian loss.
     """
-    loss = torch.tensor(0.0, device=foreground_img.device)
-    ### FILL: Compute Laplacian Loss with https://pytorch.org/docs/stable/generated/torch.nn.functional.conv2d.html.
-    ### Note: The loss is computed within the masks.
+    device = foreground_img.device
+    import torch.nn.functional as F
+    
+    kernel = torch.tensor([[0.0, 1.0, 0.0], 
+                           [1.0, -4.0, 1.0], 
+                           [0.0, 1.0, 0.0]], device=device).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
+    
+    lap_fg = F.conv2d(foreground_img, kernel, groups=3, padding=1)
+    lap_blend = F.conv2d(blended_img, kernel, groups=3, padding=1)
+    
+    lap_fg_masked = lap_fg[foreground_mask.bool().expand(-1, 3, -1, -1)]
+    lap_blend_masked = lap_blend[background_mask.bool().expand(-1, 3, -1, -1)]
+    
+    loss = F.mse_loss(lap_blend_masked, lap_fg_masked)
 
     return loss
 
@@ -179,7 +199,7 @@ def blending(foreground_image_original, background_image_original, dx, dy, polyg
     optimizer = torch.optim.Adam([blended_img], lr=1e-2)
 
     # Optimization loop
-    iter_num = 5000
+    iter_num = 2000
     for step in range(iter_num):
         blended_img_for_loss = blended_img.detach() * (1. - bg_mask_tensor) + blended_img * bg_mask_tensor  # Only blending in the mask region
 
@@ -224,6 +244,16 @@ def close_polygon_and_reset_dx(img_original, polygon_state, dx, dy, background_i
     # Update background image
     updated_background = update_background(background_image_original, updated_polygon_state, 0, dy)
     return img_with_poly, updated_polygon_state, updated_background, new_dx
+
+# Function to reset all states
+def reset_all():
+    """
+    Resets all images, states, and sliders to their initial values.
+    """
+    return (
+        None, None, None, None, None, None,
+        0, 0, initialize_polygon()
+    )
 
 # Gradio Interface
 with gr.Blocks(title="Poisson Image Blending", css="""
@@ -304,13 +334,15 @@ with gr.Blocks(title="Poisson Image Blending", css="""
     with gr.Row():
         with gr.Column():
             dx = gr.Slider(
-                label="Horizontal Offset", minimum=-500, maximum=500, step=1, value=0
+                label="Horizontal Offset", minimum=-1000, maximum=1000, step=1, value=0
             )
         with gr.Column():
             dy = gr.Slider(
-                label="Vertical Offset", minimum=-500, maximum=500, step=1, value=0
+                label="Vertical Offset", minimum=-1000, maximum=1000, step=1, value=0
             )
-        blend_button = gr.Button("Blend Images")
+        with gr.Column():
+            blend_button = gr.Button("Blend Images")
+            reset_button = gr.Button("Reset All", variant="secondary")
 
     # Interactions
 
@@ -359,5 +391,22 @@ with gr.Blocks(title="Poisson Image Blending", css="""
         outputs=output_image,
     )
 
+    # Reset all components when reset button is clicked
+    reset_button.click(
+        fn=reset_all,
+        inputs=[],
+        outputs=[
+            foreground_image_original,
+            foreground_image_with_polygon,
+            background_image,
+            background_image_with_polygon,
+            output_image,
+            background_image_original,
+            dx,
+            dy,
+            polygon_state
+        ]
+    )
+
 # Launch the Gradio app
-demo.launch()
+demo.launch(server_port=11451)

@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 import cv2
 
 class FacadesDataset(Dataset):
-    def __init__(self, list_file):
+    def __init__(self, list_file, augment=False):
         """
         Args:
             list_file (string): Path to the txt file with image filenames.
@@ -11,6 +11,7 @@ class FacadesDataset(Dataset):
         # Read the list of image filenames
         with open(list_file, 'r') as file:
             self.image_filenames = [line.strip() for line in file]
+        self.augment = augment
         
     def __len__(self):
         # Return the total number of images
@@ -20,8 +21,23 @@ class FacadesDataset(Dataset):
         # Get the image filename
         img_name = self.image_filenames[idx]
         img_color_semantic = cv2.imread(img_name)
+
         # Convert the image to a PyTorch tensor
         image = torch.from_numpy(img_color_semantic).permute(2, 0, 1).float()/255.0 * 2.0 -1.0
         image_rgb = image[:, :, :256]
         image_semantic = image[:, :, 256:]
+
+        # Apply paired augmentation after split to keep RGB/semantic transforms identical.
+        if self.augment:
+            do_hflip = torch.rand(1).item() < 0.5
+            do_vflip = torch.rand(1).item() < 0.1
+
+            if do_hflip:
+                image_rgb = torch.flip(image_rgb, dims=[2])
+                image_semantic = torch.flip(image_semantic, dims=[2])
+
+            if do_vflip:
+                image_rgb = torch.flip(image_rgb, dims=[1])
+                image_semantic = torch.flip(image_semantic, dims=[1])
+
         return image_rgb, image_semantic

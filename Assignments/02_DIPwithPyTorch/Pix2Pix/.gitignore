@@ -1,0 +1,9 @@
+train_results
+val_results
+log
+loss_plot.png
+train_list.txt
+val_list.txt
+draw_figures.py
+checkpoints
+datasets
