@@ -7,3 +7,4 @@ val_list.txt
 draw_figures.py
 checkpoints
 datasets
+download_facades_dataset.sh
