@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MultiScaleBlock(nn.Module):
@@ -115,100 +116,125 @@ class SemanticGate(nn.Module):
         return x * w
 
 
-class SkipAttentionGate(nn.Module):
-    """Attention gate for U-Net skip features conditioned on decoder features."""
+class SemanticInject(nn.Module):
+    """Inject semantic-map guidance into decoder features at matched resolution."""
 
-    def __init__(self, g_channels, x_channels, inter_channels):
+    def __init__(self, semantic_channels, feat_channels):
         super().__init__()
-        self.g_proj = nn.Sequential(
-            nn.Conv2d(g_channels, inter_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(inter_channels),
+        self.semantic_proj = nn.Sequential(
+            nn.Conv2d(semantic_channels, feat_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feat_channels),
+            nn.PReLU(feat_channels),
         )
-        self.x_proj = nn.Sequential(
-            nn.Conv2d(x_channels, inter_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(inter_channels),
-        )
-        self.psi = nn.Sequential(
-            nn.PReLU(inter_channels),
-            nn.Conv2d(inter_channels, 1, kernel_size=1, bias=True),
+        self.gate = nn.Sequential(
+            nn.Conv2d(feat_channels * 2, feat_channels, kernel_size=1, bias=True),
             nn.Sigmoid(),
         )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(feat_channels * 2, feat_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feat_channels),
+            nn.PReLU(feat_channels),
+        )
 
-    def forward(self, g, x):
-        attn = self.psi(self.g_proj(g) + self.x_proj(x))
-        return x * attn
+    def forward(self, feat, semantic_map):
+        sem = F.interpolate(semantic_map, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+        sem = self.semantic_proj(sem)
+        g = self.gate(torch.cat([feat, sem], dim=1))
+        fused = torch.cat([feat, sem * g], dim=1)
+        return self.fuse(fused)
 
 
-class UpCatBlock(nn.Module):
-    """Upsample, concatenate with skip, then fuse by residual multi-scale block."""
+class EncoderDownBlock(nn.Module):
+    """Downsampling block for the semantic encoder."""
 
-    def __init__(
-        self,
-        in_channels,
-        up_channels,
-        skip_channels,
-        out_channels,
-        drop_prob=0.15,
-        use_residual=False,
-        use_attention=True,
-    ):
+    def __init__(self, in_channels, out_channels, drop_prob=0.12, use_residual=False):
+        super().__init__()
+        self.block = MultiScaleBlock(
+            in_channels,
+            out_channels,
+            stride=2,
+            drop_prob=drop_prob,
+            use_residual=use_residual,
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DecoderUpBlock(nn.Module):
+    """Upsample and refine without any U-Net skip connections."""
+
+    def __init__(self, in_channels, out_channels, drop_prob=0.12, use_residual=True):
         super().__init__()
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, up_channels, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(up_channels),
-            nn.PReLU(up_channels),
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.PReLU(out_channels),
         )
-        if use_attention:
-            self.skip_attn = SkipAttentionGate(
-                g_channels=up_channels,
-                x_channels=skip_channels,
-                inter_channels=max(skip_channels // 2, 16),
-            )
-        else:
-            self.skip_attn = None
-        self.fuse = MultiScaleBlock(
-            up_channels + skip_channels,
+        self.refine = MultiScaleBlock(
+            out_channels,
             out_channels,
             stride=1,
             drop_prob=drop_prob,
             use_residual=use_residual,
         )
 
-    def forward(self, x, skip):
+    def forward(self, x):
         x = self.up(x)
-        if self.skip_attn is not None:
-            skip = self.skip_attn(x, skip)
-        x = torch.cat([x, skip], dim=1)
-        return self.fuse(x)
+        return self.refine(x)
+
+
+class SkipFuse(nn.Module):
+    """Fuse encoder detail features into decoder features with a learned gate."""
+
+    def __init__(self, enc_channels, dec_channels):
+        super().__init__()
+        self.enc_proj = nn.Sequential(
+            nn.Conv2d(enc_channels, dec_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dec_channels),
+            nn.PReLU(dec_channels),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(dec_channels * 2, dec_channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(dec_channels * 2, dec_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dec_channels),
+            nn.PReLU(dec_channels),
+        )
+
+    def forward(self, dec_feat, enc_feat):
+        enc = self.enc_proj(enc_feat)
+        g = self.gate(torch.cat([dec_feat, enc], dim=1))
+        return self.fuse(torch.cat([dec_feat, enc * g], dim=1))
 
 
 class FullyConvNetwork(nn.Module):
-    """U-Net VAE for 256x256 RGB input/output in [-1, 1]."""
+    """Conditional VAE for 256x256 edge-map to RGB image synthesis."""
 
-    def __init__(self, latent_channels=1024):
+    def __init__(self, latent_channels=256):
         super().__init__()
 
-        # High-resolution stem for detail-preserving refinement at output stage.
+        # Edge encoder: encode edge structure into a compact latent.
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.PReLU(32),
         )
 
-        # Encoder path (U-Net downsampling): shallow blocks without residual,
-        # deep blocks with residual to preserve high-level semantics.
-        self.enc1 = MultiScaleBlock(32, 64, stride=2, use_residual=False)        # 256 -> 128
-        self.enc2 = MultiScaleBlock(64, 128, stride=2, use_residual=False)       # 128 -> 64
-        self.enc3 = MultiScaleBlock(128, 256, stride=2, use_residual=False)      # 64 -> 32
-        self.enc4 = MultiScaleBlock(256, 384, stride=2, use_residual=False)      # 32 -> 16
-        self.enc5 = MultiScaleBlock(384, 512, stride=2, use_residual=True)        # 16 -> 8
-        self.enc6 = MultiScaleBlock(512, 768, stride=2, use_residual=True)        # 8 -> 4
-        self.bottleneck = MultiScaleBlock(768, 1024, stride=1, drop_prob=0.2, use_residual=True)   # 4 -> 4
+        self.enc1 = EncoderDownBlock(32, 64, drop_prob=0.08, use_residual=False)      # 256 -> 128
+        self.enc2 = EncoderDownBlock(64, 128, drop_prob=0.08, use_residual=False)     # 128 -> 64
+        self.enc3 = EncoderDownBlock(128, 256, drop_prob=0.10, use_residual=False)    # 64 -> 32
+        self.enc4 = EncoderDownBlock(256, 384, drop_prob=0.10, use_residual=True)     # 32 -> 16
+        self.enc5 = EncoderDownBlock(384, 512, drop_prob=0.12, use_residual=True)     # 16 -> 8
+        self.enc6 = EncoderDownBlock(512, 768, drop_prob=0.12, use_residual=True)     # 8 -> 4
+        self.bottleneck = MultiScaleBlock(768, 1024, stride=1, drop_prob=0.2, use_residual=True)
         self.semantic_context = SemanticContextHead(1024)
         self.semantic_gate_deep = SemanticGate(1024, reduction=32)
-        self.bottleneck_refine = MultiScaleBlock(1024, 1024, stride=1, drop_prob=0.2, use_residual=True)
+        self.bottleneck_refine = MultiScaleBlock(1024, 1024, stride=1, drop_prob=0.15, use_residual=True)
 
-        # Latent heads.
+        # VAE latent heads.
         self.to_mu = nn.Conv2d(1024, latent_channels, kernel_size=1)
         self.to_logvar = nn.Conv2d(1024, latent_channels, kernel_size=1)
         self.from_latent = nn.Sequential(
@@ -217,29 +243,37 @@ class FullyConvNetwork(nn.Module):
             nn.PReLU(1024),
         )
 
-        # Decoder path (U-Net upsampling with skip fusion).
-        self.bridge_fuse = MultiScaleBlock(1024 + 768, 1024, stride=1, drop_prob=0.2, use_residual=True)
+        # Decoder path.
+        self.dec6 = DecoderUpBlock(1024, 768, drop_prob=0.16, use_residual=True)     # 4 -> 8
+        self.dec5 = DecoderUpBlock(768, 512, drop_prob=0.15, use_residual=True)      # 8 -> 16
+        self.dec4 = DecoderUpBlock(512, 384, drop_prob=0.14, use_residual=True)      # 16 -> 32
+        self.dec3 = DecoderUpBlock(384, 256, drop_prob=0.12, use_residual=True)      # 32 -> 64
+        self.dec2 = DecoderUpBlock(256, 128, drop_prob=0.10, use_residual=False)     # 64 -> 128
+        self.dec1 = DecoderUpBlock(128, 64, drop_prob=0.08, use_residual=False)      # 128 -> 256
 
-        self.dec5 = UpCatBlock(1024, 512, 512, 512, drop_prob=0.15, use_residual=True, use_attention=True)   # 4 -> 8, skip enc5
-        self.dec5_refine = MultiScaleBlock(512, 512, stride=1, drop_prob=0.15, use_residual=True)
-        self.dec4 = UpCatBlock(512, 384, 384, 384, drop_prob=0.15, use_residual=True, use_attention=True)     # 8 -> 16, skip enc4
-        self.dec4_refine = MultiScaleBlock(384, 384, stride=1, drop_prob=0.15, use_residual=True)
-        self.dec3 = UpCatBlock(384, 256, 256, 256, drop_prob=0.12, use_residual=False, use_attention=True)    # 16 -> 32, skip enc3
-        self.dec3_refine = MultiScaleBlock(256, 256, stride=1, drop_prob=0.12, use_residual=False)
-        self.dec2 = UpCatBlock(256, 128, 128, 128, drop_prob=0.10, use_residual=False, use_attention=True)    # 32 -> 64, skip enc2
-        self.dec1 = UpCatBlock(128, 64, 64, 64, drop_prob=0.10, use_residual=False, use_attention=True)       # 64 -> 128, skip enc1
+        # Re-introduce shallow detail paths for edge-to-RGB reconstruction.
+        self.skip_fuse_64 = SkipFuse(enc_channels=128, dec_channels=256)
+        self.skip_fuse_128 = SkipFuse(enc_channels=64, dec_channels=128)
+        self.skip_fuse_256 = SkipFuse(enc_channels=32, dec_channels=64)
 
-        self.final_up = nn.Sequential(
-            nn.ConvTranspose2d(64, 48, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(48),
-            nn.PReLU(48),
+        # Inject semantic constraints at multiple decoder scales.
+        self.semantic_inject_8 = SemanticInject(semantic_channels=3, feat_channels=768)
+        self.semantic_inject_16 = SemanticInject(semantic_channels=3, feat_channels=512)
+        self.semantic_inject_32 = SemanticInject(semantic_channels=3, feat_channels=384)
+        self.semantic_inject_64_pre = SemanticInject(semantic_channels=3, feat_channels=256)
+        self.semantic_inject_64 = SemanticInject(semantic_channels=3, feat_channels=128)
+        self.semantic_inject_128 = SemanticInject(semantic_channels=3, feat_channels=64)
+        self.semantic_inject_256 = SemanticInject(semantic_channels=3, feat_channels=64)
+
+        # Auxiliary predictions provide deep supervision for sharper outputs.
+        self.aux_head_64 = nn.Conv2d(128, 3, kernel_size=3, padding=1)
+        self.aux_head_128 = nn.Conv2d(64, 3, kernel_size=3, padding=1)
+
+        self.output_refine = nn.Sequential(
+            MultiScaleBlock(64, 64, stride=1, drop_prob=0.06, use_residual=False),
+            SemanticGate(64, reduction=8),
+            MultiScaleBlock(64, 64, stride=1, drop_prob=0.06, use_residual=False),
         )
-        self.detail_fuse = MultiScaleBlock(48 + 32, 64, stride=1, drop_prob=0.06, use_residual=False)
-        self.final_refine = MultiScaleBlock(64, 64, stride=1, drop_prob=0.08, use_residual=False)
-        self.semantic_gate_out = SemanticGate(64, reduction=8)
-
-        # Skip regularization helps reduce over-reliance on low-level shortcuts.
-        self.skip_dropout = nn.Dropout2d(p=0.1)
 
         self.final_out = nn.Sequential(
             nn.Conv2d(64, 3, kernel_size=3, padding=1),
@@ -260,52 +294,56 @@ class FullyConvNetwork(nn.Module):
         b = self.bottleneck_refine(b)
         mu = self.to_mu(b)
         logvar = self.to_logvar(b)
-        return mu, logvar, (e0, e1, e2, e3, e4, e5, e6)
+        skips = {
+            "e0": e0,
+            "e1": e1,
+            "e2": e2,
+        }
+        return mu, logvar, skips
 
-    def reparameterize(self, mu, logvar):
+    def reparameterize(self, mu, logvar, noise_scale=1.0):
         # Clamp log-variance to avoid numerical overflow in exp.
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar)
+        std = torch.clamp(std, min=1e-4, max=1.0)
         eps = torch.randn_like(std)
-        return mu + eps * std
+        return mu + eps * std * noise_scale
 
-    def decode(self, z, skips):
-        e0, e1, e2, e3, e4, e5, e6 = skips
+    def decode(self, z, edge_input, skips):
         x = self.from_latent(z)
 
-        # Fuse bottleneck with deepest encoder feature first (same 4x4 scale).
-        if self.training:
-            e6 = self.skip_dropout(e6)
-        x = self.bridge_fuse(torch.cat([x, e6], dim=1))
+        x = self.dec6(x)
+        x = self.semantic_inject_8(x, edge_input)
+        x = self.dec5(x)
+        x = self.semantic_inject_16(x, edge_input)
+        x = self.dec4(x)
+        x = self.semantic_inject_32(x, edge_input)
+        x = self.dec3(x)
+        x = self.semantic_inject_64_pre(x, edge_input)
+        x = self.skip_fuse_64(x, skips["e2"])
+        x = self.dec2(x)
+        x = self.semantic_inject_64(x, edge_input)
+        x = self.skip_fuse_128(x, skips["e1"])
+        aux_64 = torch.tanh(
+            F.interpolate(self.aux_head_64(x), size=edge_input.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        x = self.dec1(x)
+        x = self.semantic_inject_128(x, edge_input)
+        x = self.skip_fuse_256(x, skips["e0"])
+        aux_128 = torch.tanh(
+            F.interpolate(self.aux_head_128(x), size=edge_input.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        x = self.output_refine(x)
+        x = self.semantic_inject_256(x, edge_input)
+        return self.final_out(x), [aux_128, aux_64]
 
-        if self.training:
-            e5 = self.skip_dropout(e5)
-            e4 = self.skip_dropout(e4)
-            e3 = self.skip_dropout(e3)
-            e2 = self.skip_dropout(e2)
-            e1 = self.skip_dropout(e1)
-
-        x = self.dec5(x, e5)
-        x = self.dec5_refine(x)
-        x = self.dec4(x, e4)
-        x = self.dec4_refine(x)
-        x = self.dec3(x, e3)
-        x = self.dec3_refine(x)
-        x = self.dec2(x, e2)
-        x = self.dec1(x, e1)
-        x = self.final_up(x)
-        x = self.detail_fuse(torch.cat([x, e0], dim=1))
-        x = self.final_refine(x)
-        x = self.semantic_gate_out(x)
-        return self.final_out(x)
-
-    def forward(self, x):
+    def forward(self, x, latent_noise_scale=1.0):
         mu, logvar, skips = self.encode(x)
         if self.training:
-            z = self.reparameterize(mu, logvar)
+            z = self.reparameterize(mu, logvar, noise_scale=latent_noise_scale)
         else:
             # Deterministic latent during eval gives stable validation metrics.
             z = mu
-        recon = self.decode(z, skips)
-        return recon, mu, logvar
+        recon, aux_outputs = self.decode(z, x, skips)
+        return recon, mu, logvar, aux_outputs
     
