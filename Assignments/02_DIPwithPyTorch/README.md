@@ -64,7 +64,7 @@ Outputs will be saved in "test_results" folder.
 
 ### Results
 
-The following results were all generated from the “val” portion of the edges2shoes dataset. For more results, see [HERE](./test_results)
+The following results were all generated from the “val” portion of the edges2shoes dataset. For more results, see [HERE](./Pix2Pix/test_results)
 
 **Average SSIM**: 0.915
 
