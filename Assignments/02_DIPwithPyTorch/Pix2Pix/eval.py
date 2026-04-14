@@ -40,7 +40,7 @@ def generate_test_listfile(test_dir):
 def main():
     # args
     parser = argparse.ArgumentParser(description='Evaluate the model on the test dataset.')
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the trained model file (e.g., model_epoch_10.pth)')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to the trained model file')
     parser.add_argument('--test_dir', type=str, default='datasets/facades/test', help='Path to the test list file')
     parser.add_argument("--output_dir", type=str, default="test_results", help="Directory to save test results")
     

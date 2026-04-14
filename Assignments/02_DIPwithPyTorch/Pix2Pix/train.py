@@ -60,9 +60,8 @@ def save_images(inputs, targets, outputs, folder_name, epoch, num_images=5):
         # Save the comparison image
         cv2.imwrite(f'{folder_name}/epoch_{epoch}/result_{i + 1}.png', comparison)
 
-
+# 梯度一致性约束
 def _sobel_gradient(x):
-    """Compute Sobel gradient magnitude on RGB batches."""
     gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
     kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
     ky = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
@@ -70,12 +69,11 @@ def _sobel_gradient(x):
     gy = F.conv2d(gray, ky, padding=1)
     return torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-6)
 
-
+# 全变差
 def total_variation_loss(x):
     dh = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
     dw = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
     return dh + dw
-
 
 def multiscale_l1_loss(pred, target, scales=(1, 2, 4)):
     losses = []
@@ -89,10 +87,9 @@ def multiscale_l1_loss(pred, target, scales=(1, 2, 4)):
         losses.append(F.l1_loss(p, t))
     return sum(losses) / len(losses)
 
-
+# VGG16感知损失
+# 太TM慢了，先不加了……
 class PerceptualLoss(nn.Module):
-    """VGG16 feature-space L1 loss in [0,1] domain."""
-
     def __init__(self, device):
         super().__init__()
         try:
@@ -121,34 +118,30 @@ class PerceptualLoss(nn.Module):
         return F.l1_loss(self.vgg(pred_n), self.vgg(target_n))
 
 def kl_divergence_loss(mu, logvar):
-    # Mean KL divergence per element keeps the magnitude stable across batch sizes.
     logvar = torch.clamp(logvar, min=-10.0, max=10.0)
     kld = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     kld = torch.nan_to_num(kld, nan=0.0, posinf=1e4, neginf=0.0)
     return kld.mean()
 
-
+# KL Warmup
 def get_kl_weight(epoch, warmup_epochs=60, max_kl_weight=5e-4):
-    # Linearly warm up KL regularization to reduce early training instability.
     progress = min(1.0, float(epoch + 1) / (float(warmup_epochs) + 0.0001))
     return max_kl_weight * progress
 
-
+# noise Warmup
 def get_latent_noise_scale(epoch, warmup_epochs=40, max_scale=0.35):
-    # Start close to deterministic decoding and gradually add stochasticity.
     progress = min(1.0, float(epoch + 1) / float(warmup_epochs))
     return max_scale * progress
 
 
 def compute_total_loss(recon, target_rgb, mu, logvar, aux_outputs, perceptual_fn, epoch):
-    # Dynamic edge loss stabilizes early training before focusing more on details.
     edge_weight = 0.08 if epoch < 5 else 0.12
 
     recon_l1 = F.l1_loss(recon, target_rgb)
     recon_ms = multiscale_l1_loss(recon, target_rgb)
     recon_edge = F.l1_loss(_sobel_gradient(recon), _sobel_gradient(target_rgb))
     # recon_perc = perceptual_fn(recon, target_rgb)
-    recon_perc = torch.zeros_like(recon_l1)  # Disable perceptual loss for now to speed up training and reduce memory usage.
+    recon_perc = torch.zeros_like(recon_l1)  # 禁用感知损失……太慢了
     recon_tv = total_variation_loss(recon)
     recon_kl = kl_divergence_loss(mu, logvar)
 
@@ -164,7 +157,7 @@ def compute_total_loss(recon, target_rgb, mu, logvar, aux_outputs, perceptual_fn
         + 0.7 * recon_ms
         + edge_weight * recon_edge
         + 0.15 * recon_perc
-        + 0.015 * recon_tv * 0 # no TV
+        + 0.015 * recon_tv * 0 # no TV 不符合实际需求，不需要约束全变差
         + 0.15 * aux_loss
         + kl_weight * recon_kl
     )
@@ -197,17 +190,19 @@ def train_one_epoch(model, dataloader, optimizer, perceptual_fn, device, epoch, 
     """
     model.train()
     running_loss = 0.0
+    # 统计稳定的Step数量，防止原地爆炸
     valid_steps = 0
-
+    
     for i, (image_edge, image_rgb) in enumerate(dataloader):
         # Move data to the device
         image_rgb = image_rgb.to(device, non_blocking=True)
-        image_edge = image_edge.to(device, non_blocking=True)
+        image_edge = image_edge.to(device, non_blocking=True) # e2s 边缘图
 
         # Zero the gradients
         optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass with mixed precision.
+        # Forward pass 
+        # 混合精度加速
         latent_noise_scale = get_latent_noise_scale(epoch, warmup_epochs=5, max_scale=0.35)
         with autocast(enabled=(device.type == 'cuda')):
             # Edge map -> RGB image
@@ -224,6 +219,7 @@ def train_one_epoch(model, dataloader, optimizer, perceptual_fn, device, epoch, 
             save_images(image_edge, image_rgb, recon, 'train_results', epoch)
 
         # Backward pass and optimization
+        # 规范化Loss大小稳定优化，免得VAE给训爆炸
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
@@ -259,6 +255,7 @@ def validate(model, dataloader, perceptual_fn, device, epoch, num_epochs):
     """
     model.eval()
     val_loss = 0.0
+    # 统计稳定的batch数量，防止原地爆炸
     valid_batches = 0
 
     with torch.no_grad():
@@ -269,7 +266,9 @@ def validate(model, dataloader, perceptual_fn, device, epoch, num_epochs):
 
             # Forward pass
             # Edge map -> RGB image
+            # ENC& DEC
             recon, mu, logvar, aux_outputs = model(image_edge)
+            # perceptual_fn已经禁用了
             losses = compute_total_loss(recon, image_rgb, mu, logvar, aux_outputs, perceptual_fn, epoch)
             loss = losses['total']
 
@@ -286,7 +285,7 @@ def validate(model, dataloader, perceptual_fn, device, epoch, num_epochs):
 
     # Calculate average validation loss
     if valid_batches == 0:
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Validation Loss: NaN (all batches invalid)')
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Validation Loss: NaN')
         return float('inf')
     else:
         avg_val_loss = val_loss / valid_batches
@@ -317,16 +316,17 @@ def main():
     # Initialize model, loss function, and optimizer
     model = FullyConvNetwork().to(device)
 
-    # Optional: Resume from checkpoint
+    # 加载ckpt
     resume_checkpoint = args.checkpoint
     start_epoch = 0
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         print(f"Loading checkpoint: {resume_checkpoint}")
         state_dict = torch.load(resume_checkpoint, map_location=device, weights_only=True)
         # Handle possible 'module.' prefix if saved inconsistently
+        # 如果之前保存时用了DataParallel，加载时又没用，就会有'module.'前缀不匹配的问题，这里做个兼容处理
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict, strict=False)
-        # Try to infer start epoch from filename
+        # 提取epoch信息
         try:
             parts = os.path.basename(resume_checkpoint).split('_')
             epoch_str = parts[-1].split('.')[0]
@@ -334,7 +334,7 @@ def main():
             print(f"Resuming from epoch {start_epoch}")
         except:
             print("Could not infer epoch from checkpoint name, starting from 0")
-
+    # DP训练，多卡
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for training!")
         model = nn.DataParallel(model)
@@ -343,10 +343,9 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=5e-5, betas=(0.5, 0.999), weight_decay=5e-5)
     scaler = GradScaler(enabled=(device.type == 'cuda'))
 
-    # Add a learning rate scheduler for decay
-    # scheduler = StepLR(optimizer, step_size=195, gamma=0.2)
     scheduler = MultiStepLR(optimizer, milestones=[30, 60, 80], gamma=0.5)
-    # Fast forward scheduler if resuming
+
+    # 根据当前恢复的ckpt，更新sch
     for _ in range(start_epoch):
         scheduler.step()
 
@@ -375,14 +374,14 @@ def main():
             f'train={train_loss:.4f}, val={val_loss:.4f}, lr={scheduler.get_last_lr()[0]:.6e}'
         )
 
-        # Save best checkpoint by validation loss.
+        # validation loss最好的ckpt单独保存
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             os.makedirs('checkpoints', exist_ok=True)
             state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save(state_dict, 'checkpoints/pix2pix_model_best.pth')
 
-        # Save model checkpoint every 5 epochs
+        # SV Model
         if (epoch + 1) % 1 == 0:
             os.makedirs('checkpoints', exist_ok=True)
             state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
