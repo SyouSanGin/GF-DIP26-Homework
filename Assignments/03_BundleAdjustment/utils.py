@@ -121,4 +121,3 @@ def rotvec_to_matrix(rotvec: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def matrix_to_rotvec(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return quat_to_rotvec(matrix_to_quat(R, eps=eps), eps=eps)
-
