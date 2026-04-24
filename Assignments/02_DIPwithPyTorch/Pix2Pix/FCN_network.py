@@ -2,10 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class MultiScaleBlock(nn.Module):
-    """Multi-scale block with optional residual shortcut."""
-
+# 多尺度多分枝
+class MSB(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1, drop_prob=0.15, use_residual=False):
         super().__init__()
         mid_channels = max(out_channels // 2, 32)
@@ -58,10 +56,8 @@ class MultiScaleBlock(nn.Module):
             out = out + self.shortcut(x)
         return self.act(out)
 
-
-class SemanticContextHead(nn.Module):
-    """Aggregate global and multi-dilation context to improve object-level color semantics."""
-
+# for facades 
+class SemanticCtx(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.branch1 = nn.Sequential(
@@ -93,13 +89,11 @@ class SemanticContextHead(nn.Module):
     def forward(self, x):
         g = self.global_pool(x)
         g = g.expand_as(x)
-        out = torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), g], dim=1)
+        out = torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), g], dim=1) # 多分分支融合
         return self.fuse(out)
 
-
-class SemanticGate(nn.Module):
-    """Lightweight channel-wise semantic gate."""
-
+# facades
+class Gate(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
         hidden = max(channels // reduction, 16)
@@ -115,10 +109,8 @@ class SemanticGate(nn.Module):
         w = self.gate(self.avg_pool(x))
         return x * w
 
-
-class SemanticInject(nn.Module):
-    """Inject semantic-map guidance into decoder features at matched resolution."""
-
+# facades
+class Inj(nn.Module):
     def __init__(self, semantic_channels, feat_channels):
         super().__init__()
         self.semantic_proj = nn.Sequential(
@@ -143,13 +135,11 @@ class SemanticInject(nn.Module):
         fused = torch.cat([feat, sem * g], dim=1)
         return self.fuse(fused)
 
-
-class EncoderDownBlock(nn.Module):
-    """Downsampling block for the semantic encoder."""
-
+# 降尺度
+class DownBlk(nn.Module):
     def __init__(self, in_channels, out_channels, drop_prob=0.12, use_residual=False):
         super().__init__()
-        self.block = MultiScaleBlock(
+        self.block = MSB(
             in_channels,
             out_channels,
             stride=2,
@@ -160,18 +150,16 @@ class EncoderDownBlock(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-
-class DecoderUpBlock(nn.Module):
-    """Upsample and refine without any U-Net skip connections."""
-
+# 升尺度
+class UpBlk(nn.Module):
     def __init__(self, in_channels, out_channels, drop_prob=0.12, use_residual=True):
         super().__init__()
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False), # size x2
             nn.BatchNorm2d(out_channels),
             nn.PReLU(out_channels),
         )
-        self.refine = MultiScaleBlock(
+        self.refine = MSB(
             out_channels,
             out_channels,
             stride=1,
@@ -184,9 +172,7 @@ class DecoderUpBlock(nn.Module):
         return self.refine(x)
 
 
-class SkipFuse(nn.Module):
-    """Fuse encoder detail features into decoder features with a learned gate."""
-
+class SkipLayer(nn.Module):
     def __init__(self, enc_channels, dec_channels):
         super().__init__()
         self.enc_proj = nn.Sequential(
@@ -209,70 +195,67 @@ class SkipFuse(nn.Module):
         g = self.gate(torch.cat([dec_feat, enc], dim=1))
         return self.fuse(torch.cat([dec_feat, enc * g], dim=1))
 
-
+# VAE + UNet混合结构
 class FullyConvNetwork(nn.Module):
-    """Conditional VAE for 256x256 edge-map to RGB image synthesis."""
-
     def __init__(self, latent_channels=256):
         super().__init__()
-
-        # Edge encoder: encode edge structure into a compact latent.
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.PReLU(32),
         )
+        self.enc1 = DownBlk(32, 64, drop_prob=0.08, use_residual=False)      # 256 -> 128
+        self.enc2 = DownBlk(64, 128, drop_prob=0.08, use_residual=False)     # 128 -> 64
+        self.enc3 = DownBlk(128, 256, drop_prob=0.10, use_residual=False)    # 64 -> 32
+        self.enc4 = DownBlk(256, 384, drop_prob=0.10, use_residual=True)     # 32 -> 16
+        self.enc5 = DownBlk(384, 512, drop_prob=0.12, use_residual=True)     # 16 -> 8
+        self.enc6 = DownBlk(512, 768, drop_prob=0.12, use_residual=True)     # 8 -> 4
+        self.bottleneck = MSB(768, 1024, stride=1, drop_prob=0.2, use_residual=True)
+        self.semantic_context = SemanticCtx(1024)
+        self.semantic_gate_deep = Gate(1024, reduction=32)
+        self.bottleneck_refine = MSB(1024, 1024, stride=1, drop_prob=0.15, use_residual=True)
 
-        self.enc1 = EncoderDownBlock(32, 64, drop_prob=0.08, use_residual=False)      # 256 -> 128
-        self.enc2 = EncoderDownBlock(64, 128, drop_prob=0.08, use_residual=False)     # 128 -> 64
-        self.enc3 = EncoderDownBlock(128, 256, drop_prob=0.10, use_residual=False)    # 64 -> 32
-        self.enc4 = EncoderDownBlock(256, 384, drop_prob=0.10, use_residual=True)     # 32 -> 16
-        self.enc5 = EncoderDownBlock(384, 512, drop_prob=0.12, use_residual=True)     # 16 -> 8
-        self.enc6 = EncoderDownBlock(512, 768, drop_prob=0.12, use_residual=True)     # 8 -> 4
-        self.bottleneck = MultiScaleBlock(768, 1024, stride=1, drop_prob=0.2, use_residual=True)
-        self.semantic_context = SemanticContextHead(1024)
-        self.semantic_gate_deep = SemanticGate(1024, reduction=32)
-        self.bottleneck_refine = MultiScaleBlock(1024, 1024, stride=1, drop_prob=0.15, use_residual=True)
-
-        # VAE latent heads.
+        # VAE
         self.to_mu = nn.Conv2d(1024, latent_channels, kernel_size=1)
         self.to_logvar = nn.Conv2d(1024, latent_channels, kernel_size=1)
+        
+        # dec
         self.from_latent = nn.Sequential(
             nn.Conv2d(latent_channels, 1024, kernel_size=1, bias=False),
             nn.BatchNorm2d(1024),
             nn.PReLU(1024),
         )
 
-        # Decoder path.
-        self.dec6 = DecoderUpBlock(1024, 768, drop_prob=0.16, use_residual=True)     # 4 -> 8
-        self.dec5 = DecoderUpBlock(768, 512, drop_prob=0.15, use_residual=True)      # 8 -> 16
-        self.dec4 = DecoderUpBlock(512, 384, drop_prob=0.14, use_residual=True)      # 16 -> 32
-        self.dec3 = DecoderUpBlock(384, 256, drop_prob=0.12, use_residual=True)      # 32 -> 64
-        self.dec2 = DecoderUpBlock(256, 128, drop_prob=0.10, use_residual=False)     # 64 -> 128
-        self.dec1 = DecoderUpBlock(128, 64, drop_prob=0.08, use_residual=False)      # 128 -> 256
+        self.dec6 = UpBlk(1024, 768, drop_prob=0.16, use_residual=True)     # 4 -> 8
+        self.dec5 = UpBlk(768, 512, drop_prob=0.15, use_residual=True)      # 8 -> 16
+        self.dec4 = UpBlk(512, 384, drop_prob=0.14, use_residual=True)      # 16 -> 32
+        self.dec3 = UpBlk(384, 256, drop_prob=0.12, use_residual=True)      # 32 -> 64
+        self.dec2 = UpBlk(256, 128, drop_prob=0.10, use_residual=False)     # 64 -> 128
+        self.dec1 = UpBlk(128, 64, drop_prob=0.08, use_residual=False)      # 128 -> 256
 
-        # Re-introduce shallow detail paths for edge-to-RGB reconstruction.
-        self.skip_fuse_64 = SkipFuse(enc_channels=128, dec_channels=256)
-        self.skip_fuse_128 = SkipFuse(enc_channels=64, dec_channels=128)
-        self.skip_fuse_256 = SkipFuse(enc_channels=32, dec_channels=64)
+        self.skip_fuse_64 = SkipLayer(enc_channels=128, dec_channels=256)
+        self.skip_fuse_128 = SkipLayer(enc_channels=64, dec_channels=128)
+        self.skip_fuse_256 = SkipLayer(enc_channels=32, dec_channels=64)
 
-        # Inject semantic constraints at multiple decoder scales.
-        self.semantic_inject_8 = SemanticInject(semantic_channels=3, feat_channels=768)
-        self.semantic_inject_16 = SemanticInject(semantic_channels=3, feat_channels=512)
-        self.semantic_inject_32 = SemanticInject(semantic_channels=3, feat_channels=384)
-        self.semantic_inject_64_pre = SemanticInject(semantic_channels=3, feat_channels=256)
-        self.semantic_inject_64 = SemanticInject(semantic_channels=3, feat_channels=128)
-        self.semantic_inject_128 = SemanticInject(semantic_channels=3, feat_channels=64)
-        self.semantic_inject_256 = SemanticInject(semantic_channels=3, feat_channels=64)
+        # 在不同层中注入输入图像的原始的语义信息
+        self.semantic_inject_8 = Inj(semantic_channels=3, feat_channels=768)
+        self.semantic_inject_16 = Inj(semantic_channels=3, feat_channels=512)
+        self.semantic_inject_32 = Inj(semantic_channels=3, feat_channels=384)
+        self.semantic_inject_64_pre = Inj(semantic_channels=3, feat_channels=256)
+        self.semantic_inject_64 = Inj(semantic_channels=3, feat_channels=128)
+        self.semantic_inject_128 = Inj(semantic_channels=3, feat_channels=64)
+        self.semantic_inject_256 = Inj(semantic_channels=3, feat_channels=64)
 
-        # Auxiliary predictions provide deep supervision for sharper outputs.
+
+        # 中间层解码，提供辅助约束
         self.aux_head_64 = nn.Conv2d(128, 3, kernel_size=3, padding=1)
         self.aux_head_128 = nn.Conv2d(64, 3, kernel_size=3, padding=1)
 
+        # 输出
         self.output_refine = nn.Sequential(
-            MultiScaleBlock(64, 64, stride=1, drop_prob=0.06, use_residual=False),
-            SemanticGate(64, reduction=8),
-            MultiScaleBlock(64, 64, stride=1, drop_prob=0.06, use_residual=False),
+            MSB(64, 64, stride=1, drop_prob=0.06, use_residual=False),
+            Gate(64, reduction=8),
+            MSB(64, 64, stride=1, drop_prob=0.06, use_residual=False),
         )
 
         self.final_out = nn.Sequential(
@@ -288,12 +271,17 @@ class FullyConvNetwork(nn.Module):
         e4 = self.enc4(e3)
         e5 = self.enc5(e4)
         e6 = self.enc6(e5)
+        # for facades Semmantic -> RGB
+        # 似乎没什么用？？？
         b = self.bottleneck(e6)
         b = self.semantic_context(b)
         b = self.semantic_gate_deep(b)
         b = self.bottleneck_refine(b)
+        
+        # 最大深度->VAE
         mu = self.to_mu(b)
         logvar = self.to_logvar(b)
+        # 高层使用Skip Connection
         skips = {
             "e0": e0,
             "e1": e1,
@@ -302,7 +290,6 @@ class FullyConvNetwork(nn.Module):
         return mu, logvar, skips
 
     def reparameterize(self, mu, logvar, noise_scale=1.0):
-        # Clamp log-variance to avoid numerical overflow in exp.
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         std = torch.clamp(std, min=1e-4, max=1.0)
