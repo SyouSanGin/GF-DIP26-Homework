@@ -9,6 +9,7 @@
 - [Assignment_01](Assignments/01_ImageWarping/) (Due: 2026.03.24)
 - [Assignment_02](Assignments/02_DIPwithPyTorch/) (Due: 2026.04.14)
 - [Assignment_03](Assignments/03_BundleAdjustment/) (Due: 2026.04.30)
+- [Assignment_04](Assignments/04_3DGS/) (Due: 2026.06.21)
 
 
 - [作业提交模板](https://github.com/paperswithcode/releasing-research-code/blob/master/templates/README.md)
