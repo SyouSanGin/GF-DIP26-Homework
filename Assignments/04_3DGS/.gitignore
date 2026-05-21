@@ -1,0 +1,12 @@
+RaDe-GS/
+__pycache__/
+data/chair/checkpoints/
+data/chair/*.db
+data/chair/output_radegs/
+data/chair/output_3dgs_speedtest/
+data/chair/projections/
+data/chair/sparse/
+data/chair/*.mp4
+comparison_radegs.md
+results_summary.md
+REPORT.md

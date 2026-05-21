@@ -13,10 +13,10 @@ if __name__ == '__main__':
     data_dir = args.data_dir
 
     # Feature extraction with shared intrinsics (assume it's the same camera)
-    subprocess.run(['colmap', 'feature_extractor', '--image_path', os.path.join(data_dir, 'images'), '--database_path', os.path.join(data_dir, 'database.db'), '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'PINHOLE', '--SiftExtraction.use_gpu', '0'], check=True)
+    subprocess.run(['colmap', 'feature_extractor', '--image_path', os.path.join(data_dir, 'images'), '--database_path', os.path.join(data_dir, 'database.db'), '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'PINHOLE', '--FeatureExtraction.use_gpu', '0'], check=True)
 
     # Feature matching
-    subprocess.run(['colmap', 'exhaustive_matcher', '--database_path', os.path.join(data_dir, 'database.db'), '--SiftMatching.use_gpu', '0'], check=True)
+    subprocess.run(['colmap', 'exhaustive_matcher', '--database_path', os.path.join(data_dir, 'database.db'), '--FeatureMatching.use_gpu', '0'], check=True)
 
     # Create sparse reconstruction folder
     os.makedirs(os.path.join(data_dir, 'sparse'), exist_ok=True)
